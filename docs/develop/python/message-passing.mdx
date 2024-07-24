@@ -301,46 +301,110 @@ To send a Query to a Workflow Execution from Client code, use the `query()` meth
     result = await handle.query(GreetingWorkflow.greeting)
 ```
 
-## Develop with Updates {#updates}
+## Developing with Updates {#updates}
 
-An [Update](/encyclopedia/workflow-message-passing#updates) is an operation that can mutate the state of a Workflow Execution and return a response.
+An [Update](/encyclopedia/workflow-message-passing#updates) is a trackable request sent synchronously to a running Workflow Execution that can change the state and control the flow of a Workflow Execution, and return a result.
+The sender of the request must wait until the update is at least accepted or rejected by a Worker, and will often opt to wait further to receive the value returned by the Update handler, or an exception indicating what went wrong. Update handlers can do arbitrarily long-running async operations (like signal handlers, and the main workflow method).
 
-### How to define an Update {#define-update}
 
-Workflow Updates handlers are methods in your Workflow Definition designed to handle updates.
-These updates can be triggered during the lifecycle of a Workflow Execution.
+### Writing Update handlers and validators as a Workflow author
 
-**Define an Update Handler**
-
-To define an update handler, use the [@workflow.update](https://python.temporal.io/temporalio.workflow.html#update) decorator on a method within your Workflow. This decorator can be applied to both asynchronous and synchronous methods.
-
-- **Decorator Usage:** Apply `@workflow.update` to the method intended to handle updates.
-- **Overriding:** If a method with this decorator is overridden, the overriding method should also be decorated with `@workflow.update`.
-- **Validator Method:** Optionally, you can define a validator method for the update handler. This validator is specified using `@update_handler_method_name.validator` and is invoked before the update handler.
-- **Method Parameters:** Update handlers should only use positional parameters. For non-dynamic methods, it's recommended to use a single parameter that is an object or data class, which allows for future expansion of fields.
-- **Return Values:** The update handler can return a serializable value. This value is sent back to the caller of the update.
+Here's a Workflow Definition that illustrates how to create an Update handler, and an associated validator:
 
 ```python
-# ...
+@dataclass
+class HelloWorldInput:
+    entity_to_be_greeted: str
+
+
+@workflow.defn
+class HelloWorldWorkflow:
+    def __init__(self):
+        self.entity_to_be_greeted: Optional[str] = None
+
+    @workflow.run
+    async def run(self) -> str:
+        await workflow.wait_condition(lambda: self.entity_to_be_greeted is not None)
+        return self.greeting()
+
     @workflow.update
-    async def update_workflow_status(self) -> str:
-        self.is_complete = True
-        return "Workflow status updated"
+    def set_greeting(self, input: HelloWorldInput) -> str:
+        self.entity_to_be_greeted = input.entity_to_be_greeted
+        return self.greeting()
+
+    @set_greeting.validator
+    def set_greeting_validator(self, input: HelloWorldInput) -> None:
+        if input.entity_to_be_greeted not in {"world", "World"}:
+            raise Exception(f"invalid entity: {input.entity_to_be_greeted}")
+
+    def greeting(self) -> str:
+        return f"Hello, {self.entity_to_be_greeted}!"
 ```
 
-### Send an Update from a Temporal Client {#send-update-from-client}
+Note the following:
 
-**How to send an Update from a Temporal Client**
+- Update handlers and validators are defined using decorators, in a similar way to Signal and Query handlers.
+- This handler method does not do any long-running async operations; if it did, it would need to be an `async def`.
+- Examples of async operations that can be done in an update handler include [`asyncio.sleep(...)`](https://docs.python.org/3/library/asyncio-task.html#asyncio.sleep), [`workflow.wait_condition(...)`](https://python.temporal.io/temporalio.workflow.html#wait_condition), and execution of Activities and Child Workflows.
+- The handler method signature defines the argument type and return type that a client will use when sending an Update.
+- It is possible to use multiple arguments, but this is not recommended: instead use a single dataclass argument in which fields can be added/removed as needed.
+- Validators are optional; if you don't want to be able to reject updates then you don't need a validator.
+- To reject an Update, you raise an exception (of any type) in the validator.
+- The name of the decorator you use to define the validator is based on the name that you give to the handler.
+- The validator must take the same argument type as the handler, but always returns `None`.
+- The [`update`](https://python.temporal.io/temporalio.workflow.html#update) decorator accepts arguments.
 
-To send a Workflow Update from a Temporal Client, call the [execute_update](https://python.temporal.io/temporalio.client.WorkflowHandle.html#execute_update) method on the [WorkflowHandle](https://python.temporal.io/temporalio.client.WorkflowHandle.html) class.
+
+
+### Sending an Update to a Workflow Execution
+
+Recall that when sending an Update, the client will not receive a response until a Worker is available and the Update has been delivered to the Worker. If you want the server to send a response as soon as it receives your request, then you must use a Signal instead. 
+
+To send an Update to a Workflow Execution, you have two choices:
+
+#### 1. Use [`execute_update`](https://python.temporal.io/temporalio.client.WorkflowHandle.html#execute_update) to wait for the update to complete
+
+[`execute_update`](https://python.temporal.io/temporalio.client.WorkflowHandle.html#execute_update) sends an Update and waits until it has been completed by a Worker. It returns the Update result:
 
 ```python
-# ...
-    update_result = await handle.execute_update(
-        HelloWorldWorkflow.update_workflow_status
-    )
-    print(f"Update Result: {update_result}")
+# Wait until the update is completed
+update_result = await workflow_handle.execute_update(
+    HelloWorldWorkflow.set_greeting,
+    HelloWorldInput("World"),
+)
 ```
+
+#### 2. Use [`start_update`](https://python.temporal.io/temporalio.client.WorkflowHandle.html#start_update) to receive a handle as soon as the update is accepted or rejected
+
+[`start_update`](https://python.temporal.io/temporalio.client.WorkflowHandle.html#start_update) sends an Update and waits until the Update has been accepted or rejected by a Worker. It returns an [`UpdateHandle`](https://python.temporal.io/temporalio.client.WorkflowUpdateHandle.html):
+
+```python
+# Wait until the update is accepted
+update_handle = await workflow_handle.start_update(
+    HelloWorldWorkflow.set_greeting,
+    HelloWorldInput("World"),
+)
+# Wait until the update is completed
+update_result = await update_handle.result()
+```
+
+#### Exceptions
+
+The following exceptions might be raised by [`execute_update`](https://python.temporal.io/temporalio.client.WorkflowHandle.html#execute_update), or when calling [`update_handle.result()`](https://python.temporal.io/temporalio.client.WorkflowUpdateHandle.html#result) on a handle obtained from [`start_update`](https://python.temporal.io/temporalio.client.WorkflowHandle.html#start_update):
+
+- [`temporalio.client.WorkflowUpdateFailedError`](https://python.temporal.io/temporalio.client.WorkflowUpdateFailedError.html)
+
+  The Update was either rejected by the validator, or the Workflow author deliberately failed the Update by raising [`ApplicationError`](https://python.temporal.io/temporalio.exceptions.ApplicationError.html) in the handler.
+
+- [`temporalio.service.RPCError`](https://python.temporal.io/temporalio.service.RPCError.html) "workflow execution already completed"`
+
+  This will happen if the Workflow finished while the Update handler execution was in progress, for example because
+  - The Workflow was canceled or was deliberately failed (the Workflow author raised [`ApplicationError`](https://python.temporal.io/temporalio.exceptions.ApplicationError.html) outside an Update handler)
+  - The Workflow completed normally or continued-as-new and the Workflow author did not [wait for handlers to be finished](/encyclopedia/workflow-message-passing#finishing-message-handlers).
+
+If the Workflow handle references a Workflow that doesn't exist then [`execute_update`](https://python.temporal.io/temporalio.client.WorkflowHandle.html#execute_update) and [`start_update`](https://python.temporal.io/temporalio.client.WorkflowHandle.html#start_update) will both raise `temporalio.service.RPCError "sql: no rows in result set"`.
+
+
 
 ## Dynamic Handler {#dynamic-handler}
 
